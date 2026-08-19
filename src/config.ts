@@ -21,7 +21,7 @@ export const config = {
   port: parseInt(process.env['PORT'] ?? '3000', 10),
   couchdbUrl: buildCouchdbUrl(),
   stromUrl: process.env['STROM_URL'] ?? 'http://localhost:7000',
-  stromToken: process.env['STROM_AUTH_TOKEN'] ?? process.env['STROM_TOKEN'] ?? undefined,
+  stromToken: process.env['STROM_AUTH_TOKEN'] ?? process.env['STROM_API_KEY'] ?? process.env['STROM_TOKEN'] ?? undefined,
   /** 'osc' = PAT→SAT exchange via token.svc.prod.osaas.io (default for OSC-hosted Strom)
    *  'direct' = API key used as Bearer token directly (self-hosted / non-OSC Strom) */
   stromAuthMode: (process.env['STROM_AUTH_MODE'] ?? 'osc') as 'osc' | 'direct',

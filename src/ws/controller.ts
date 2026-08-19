@@ -3,7 +3,8 @@ import type { WebSocket } from '@fastify/websocket';
 import { z } from 'zod';
 import { getDb, getSourcesDb } from '../db/index.js';
 import { updateProductionDoc } from '../routes/productions.js';
-import type { ProductionDoc } from '../db/types.js';
+import type { ProductionDoc, SourceDoc } from '../db/types.js';
+import { sourceExposesAudio } from '../db/types.js';
 import { getTally, setTally, subscribe, unsubscribe, broadcast } from '../services/tally.service.js';
 import { startMeterRelay, stopMeterRelay } from '../services/meter-relay.js';
 import { StromClient, StromClientError, type TransitionType as StromTransitionType, type PipZone, type PipConfig, type PipTransforms, type VideoEffect, type EffectTarget, type SetVideoEffectRequest } from '../lib/strom.js';
@@ -373,19 +374,17 @@ async function resolveAudioChannelIndex(doc: ProductionDoc, mixerInput: string):
   const sourcesDb = getSourcesDb();
   let audioIdx = 0;
   for (const assignment of sorted) {
-    let streamType: string | undefined;
+    let src: Pick<SourceDoc, 'streamType' | 'mxlAudioFlowId'> | undefined;
     try {
-      const src = await sourcesDb.get(assignment.sourceId);
-      streamType = src.streamType;
+      src = await sourcesDb.get(assignment.sourceId);
     } catch {
-      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
       if (assignment.sourceId === 'Whip') {
-        streamType = 'whip';
+        src = { streamType: 'whip' };
       } else {
         continue; // other virtual sources (test1, test2) have no audio
       }
     }
-    if (streamType === 'test1' || streamType === 'test2') continue;
+    if (!sourceExposesAudio(src)) continue;
     if (assignment.mixerInput === mixerInput) return audioIdx;
     audioIdx++;
   }
@@ -422,19 +421,17 @@ async function applyAudioFollow(
   const properties: Record<string, unknown> = {};
   const ramp_ms_overrides: Record<string, number> = {};
   for (const assignment of sorted) {
-    let streamType: string | undefined;
+    let src: Pick<SourceDoc, 'streamType' | 'mxlAudioFlowId'> | undefined;
     try {
-      const src = await sourcesDb.get(assignment.sourceId);
-      streamType = src.streamType;
+      src = await sourcesDb.get(assignment.sourceId);
     } catch {
-      // "Whip" is a virtual WHIP source that carries audio — treat it as 'whip'
       if (assignment.sourceId === 'Whip') {
-        streamType = 'whip';
+        src = { streamType: 'whip' };
       } else {
         continue; // other virtual sources (test1, test2) have no audio
       }
     }
-    if (streamType === 'test1' || streamType === 'test2') continue;
+    if (!sourceExposesAudio(src)) continue;
 
     const chIdx = ++audioIdx;
     // Only update routing for channels the operator has opted into AFV.
