@@ -1,8 +1,12 @@
 import { randomUUID } from 'crypto';
 import type { ProductionDoc, SourceDoc, GraphicDoc, OutputDoc } from '../db/types.js';
+import { sourceExposesAudio } from '../db/types.js';
 import { getSourcesDb, getGraphicsDb } from '../db/index.js';
 import { StromClient } from './strom.js';
 import { DEFAULT_FLOW, type FlowTopology } from './default-flow.js';
+import { parseMxlFlowId } from './url-validation.js';
+
+const DEFAULT_MXL_DOMAIN = '/dev/shm/mxl';
 
 /**
  * Generates a Strom flow from a template + source assignments,
@@ -297,7 +301,14 @@ export async function activateStromFlow(
   // Strip ALL inputs wired to video_in_N pads on the mixer (dynamic blocks AND
   // static template placeholders like videotestsrc). We rebuild all video inputs
   // from production.sources, so the template's static elements must be removed.
-  const DYNAMIC_INPUT_BLOCK_DEFS = new Set(['builtin.mpegtssrt_input', 'builtin.efpsrt_input', 'builtin.whip_input']);
+  const DYNAMIC_INPUT_BLOCK_DEFS = new Set([
+    'builtin.mpegtssrt_input',
+    'builtin.efpsrt_input',
+    'builtin.whip_input',
+    'builtin.mxl_video_input',
+    'builtin.mxl_audio_input',
+    'builtin.decklink_input',
+  ]);
   const strippedVideoInputIds = new Set<string>();
 
   // Collect dynamic block IDs (mpegtssrt_input, whip_input)
@@ -376,15 +387,15 @@ export async function activateStromFlow(
     mixerBlock['properties'] = props;
   }
 
-  // Set num_channels on the audio mixer = number of SRT/EFP/WHIP sources
-  // (test1/test2 sources don't carry audio; html sources do via cefdemux).
+  // Set num_channels on the audio mixer = number of sources that actually expose audio
+  // (srt/efp/whip/html/decklink; mxl only when mxlAudioFlowId is set; test1/test2 never).
   // num_channels is a UInt — set it to exactly the number of audio-bearing sources.
   if (audioMixerBlock) {
-    const srtEfpCount = sortedAssignments.filter((a) => {
+    const audioSourceCount = sortedAssignments.filter((a) => {
       const src = sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined);
-      return src && src.streamType !== 'test1' && src.streamType !== 'test2';
+      return src && sourceExposesAudio(src);
     }).length;
-    const numChannels = Math.max(1, srtEfpCount);
+    const numChannels = Math.max(1, audioSourceCount);
     const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
     props['num_channels'] = numChannels;
     // ch{N}_aux{M}_pre is a build-time topology property — must be set here at flow
@@ -410,9 +421,13 @@ export async function activateStromFlow(
   // Compute the highest latency across all SRT/EFP sources. Each source keeps its
   // own configured latency; the max is used only to set min_upstream_latency on the
   // mixers so the aggregators never starve waiting for the slowest source.
+  // Compute the highest latency across all SRT/EFP sources. Each source keeps its
+  // own configured latency; the max is used only to set min_upstream_latency on the
+  // mixers so the aggregators never starve waiting for the slowest source.
+  // Local MXL/DeckLink (and WHIP/HTML) must not inflate this.
   const srtLatencies = sortedAssignments
     .map((a) => sourceMap.get(a.sourceId) ?? (VIRTUAL_SOURCES[a.sourceId] as SourceDoc | undefined))
-    .filter((s): s is SourceDoc => !!s && s.streamType !== 'test1' && s.streamType !== 'test2' && s.streamType !== 'whip' && s.streamType !== 'html')
+    .filter((s): s is SourceDoc => !!s && (s.streamType === 'srt' || s.streamType === 'efp'))
     .map((s) => s.latency ?? 125);
   const maxSourceLatency = srtLatencies.length > 0 ? Math.max(...srtLatencies) : 125;
 
@@ -552,6 +567,104 @@ export async function activateStromFlow(
       flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
       if (audioMixerBlock && audioMixerBlockId) {
         flow.links.push({ from: `${audioOffsetIdWhip}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+        if (source.name) {
+          const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+          props[`ch${audioChannel + 1}_label`] = source.name;
+          audioMixerBlock['properties'] = props;
+        }
+      }
+    } else if (source.streamType === 'mxl') {
+      const videoFlowId = parseMxlFlowId(source.address);
+      const domain = source.mxlDomain?.trim() || DEFAULT_MXL_DOMAIN;
+      flow.blocks.push({
+        id: inputId,
+        block_definition_id: 'builtin.mxl_video_input',
+        name: `MXL Input (V${padIndex})`,
+        properties: {
+          domain,
+          video_flow_id: videoFlowId,
+          backend: source.mxlBackend ?? 'auto',
+          colorimetry_override: 'auto',
+          full_range: false,
+        },
+        position: { x: COL_INPUT, y: yPos },
+      });
+      // GPU path emits memory:GLMemory — do not insert videoformat in front of MXL.
+      flow.links.push({ from: `${inputId}:video_out`, to: `${offsetId}:in` });
+      if (source.mxlAudioFlowId?.trim()) {
+        const audioChannel = audioChannelIndex++;
+        const mxlAudioId = `b-mxl-audio-${padIndex}-${endpointSuffix}`;
+        flow.blocks.push({
+          id: mxlAudioId,
+          block_definition_id: 'builtin.mxl_audio_input',
+          name: `MXL Audio (V${padIndex})`,
+          properties: {
+            domain,
+            audio_flow_id: parseMxlFlowId(source.mxlAudioFlowId),
+          },
+          position: { x: COL_INPUT, y: yPos + 80 },
+        });
+        const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+        flow.blocks.push({
+          id: audioOffsetId,
+          block_definition_id: 'builtin.time_offset',
+          name: `Offset A${padIndex}`,
+          properties: { offset_ms: 0.0 },
+          position: { x: COL_OFFSET, y: yPos + 80 },
+        });
+        sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+        flow.links.push({ from: `${mxlAudioId}:audio_out`, to: `${audioOffsetId}:in` });
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+        if (audioMixerBlock && audioMixerBlockId) {
+          flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
+          if (source.name) {
+            const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
+            props[`ch${audioChannel + 1}_label`] = source.name;
+            audioMixerBlock['properties'] = props;
+          }
+        }
+      }
+    } else if (source.streamType === 'decklink') {
+      const audioChannel = audioChannelIndex++;
+      const fmtId = `b-fmt-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: inputId,
+        block_definition_id: 'builtin.decklink_input',
+        name: `DeckLink Input (V${padIndex})`,
+        properties: {
+          device_number: parseInt(source.address, 10),
+          stream_mode: 'audio_video',
+          mode: source.decklinkMode || 'auto',
+          connection: source.decklinkConnection || 'auto',
+          video_format: source.decklinkVideoFormat || 'auto',
+        },
+        position: { x: COL_ELEM, y: yPos },
+      });
+      // DeckLink delivers native card formats (often v210) — convert to mixer resolution.
+      flow.blocks.push({
+        id: fmtId,
+        block_definition_id: 'builtin.videoformat',
+        name: `Format V${padIndex}`,
+        properties: { resolution: pgmResolution },
+        position: { x: COL_INPUT, y: yPos },
+      });
+      flow.links.push(
+        { from: `${inputId}:video_out`, to: `${fmtId}:video_in` },
+        { from: `${fmtId}:video_out`, to: `${offsetId}:in` },
+      );
+      const audioOffsetId = `b-audio-offset-${padIndex}-${endpointSuffix}`;
+      flow.blocks.push({
+        id: audioOffsetId,
+        block_definition_id: 'builtin.time_offset',
+        name: `Offset A${padIndex}`,
+        properties: { offset_ms: 0.0 },
+        position: { x: COL_OFFSET, y: yPos + 80 },
+      });
+      sourceAudioOffsetBlockIds[assignment.mixerInput] = audioOffsetId;
+      flow.links.push({ from: `${inputId}:audio_out`, to: `${audioOffsetId}:in` });
+      flow.links.push({ from: `${audioOffsetId}:out`, to: `${mixerBlockId}:audio_in_${padIndex}` });
+      if (audioMixerBlock && audioMixerBlockId) {
+        flow.links.push({ from: `${audioOffsetId}:out`, to: `${audioMixerBlockId}:input_${audioChannel + 1}` });
         if (source.name) {
           const props = (audioMixerBlock['properties'] ?? {}) as Record<string, unknown>;
           props[`ch${audioChannel + 1}_label`] = source.name;
@@ -728,6 +841,61 @@ export async function activateStromFlow(
         }
         whepOutputEntries.push({ outputId: outputDoc._id, endpointId });
         outputBlockIndex++;
+      } else if (outputDoc.outputType === 'mxl') {
+        // Uncompressed v210 tap on mixer pads — never Enc PGM / Enc MV / pgmFeedPad.
+        if (!outputDoc.url?.trim()) {
+          console.warn(`[flow-generator] Skipping MXL output ${outputDoc._id} (${outputDoc.name}) — empty flow_id/url`);
+          continue;
+        }
+        if (!mixerBlockId) {
+          console.warn(`[flow-generator] Skipping MXL output ${outputDoc._id} — no vision mixer in flow`);
+          continue;
+        }
+        const tap = outputDoc.mxlTap === 'multiview' ? 'multiview' : 'pgm';
+        const domain = outputDoc.mxlDomain?.trim() || DEFAULT_MXL_DOMAIN;
+        const videoBlockId = `b-mxl-v-${tap}-${idSlug}-${endpointSuffix}`;
+        const mixerPad = tap === 'multiview' ? `${mixerBlockId}:multiview_out` : `${mixerBlockId}:pgm_out`;
+        const groupHint = outputDoc.mxlGroupHint
+          || (tap === 'multiview' ? 'Mixer:Multiview' : 'Mixer:Video');
+        flow.blocks.push({
+          id: videoBlockId,
+          block_definition_id: 'builtin.mxl_video_output',
+          name: outputDoc.name,
+          properties: {
+            domain,
+            flow_id: parseMxlFlowId(outputDoc.url),
+            backend: outputDoc.mxlBackend ?? 'auto',
+            colorimetry_override: 'auto',
+            full_range: false,
+            label: outputDoc.mxlLabel || outputDoc.name,
+            group_hint: groupHint,
+          },
+          position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+        });
+        flow.links.push({ from: mixerPad, to: `${videoBlockId}:video_in` });
+        outputBlockIndex++;
+        if (outputDoc.mxlAudioFlowId?.trim()) {
+          const audioBlockId = `b-mxl-a-${tap}-${idSlug}-${endpointSuffix}`;
+          const audioFrom = outputDoc.mxlAudioSource === 'monitor' ? monitorAudioSource : mainAudioSource;
+          if (!audioFrom) {
+            console.warn(`[flow-generator] Skipping MXL audio for ${outputDoc._id} — no audio mixer pad`);
+          } else {
+            flow.blocks.push({
+              id: audioBlockId,
+              block_definition_id: 'builtin.mxl_audio_output',
+              name: `${outputDoc.name} Audio`,
+              properties: {
+                domain,
+                flow_id: parseMxlFlowId(outputDoc.mxlAudioFlowId),
+                label: outputDoc.mxlLabel || outputDoc.name,
+                group_hint: 'Mixer:Audio',
+              },
+              position: { x: COL_OUTPUT, y: ROW_START + outputBlockIndex * ROW_H },
+            });
+            flow.links.push({ from: audioFrom, to: `${audioBlockId}:audio_in` });
+            outputBlockIndex++;
+          }
+        }
       } else {
         // mpegtssrt or efpsrt — both use the MPEG-TS/SRT output block.
         // Skip if no URL — an empty srt_uri fails at GStreamer READY state.

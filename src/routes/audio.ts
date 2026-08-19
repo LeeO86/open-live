@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { getDb, getSourcesDb } from '../db/index.js';
+import { sourceExposesAudio } from '../db/types.js';
 import { StromClient } from '../lib/strom.js';
 import { getStromToken } from '../lib/strom-token.js';
 import { config } from '../config.js';
@@ -76,7 +77,7 @@ const audioRoutes: FastifyPluginAsync = async (fastify) => {
           for (const assignment of sortedAssignments) {
             try {
               const src = VIRTUAL_SOURCES[assignment.sourceId] ?? await sourcesDb.get(assignment.sourceId);
-              if (src.streamType === 'test1' || src.streamType === 'test2') continue;
+              if (!sourceExposesAudio(src)) continue;
               audioChannelNameMap.set(audioIdx, src.name);
               audioChannelMixerInputMap.set(audioIdx, assignment.mixerInput);
               audioIdx++;

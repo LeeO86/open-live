@@ -2,31 +2,55 @@ import type { FastifyPluginAsync } from 'fastify';
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { getSourcesDb, getDb } from '../db/index.js';
-import type { SourceDoc, ProductionDoc } from '../db/types.js';
+import type { SourceDoc, ProductionDoc, StreamType } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
-import { graphicUrl, srtUrl } from '../lib/url-validation.js';
+import { decklinkDevice, graphicUrl, mxlDomain, mxlFlowId, srtUrl } from '../lib/url-validation.js';
+
+const CREATABLE_STREAM_TYPES = ['srt', 'efp', 'whip', 'html', 'mxl', 'decklink'] as const;
+
+const MxlBackend = z.enum(['auto', 'gpu', 'cpu']);
+
+function validateSourceAddress(streamType: StreamType | (typeof CREATABLE_STREAM_TYPES)[number], address: string): void {
+  if (streamType === 'html') {
+    graphicUrl(address);
+  } else if (streamType === 'srt' || streamType === 'efp') {
+    srtUrl(address);
+  } else if (streamType === 'mxl') {
+    mxlFlowId(address);
+  } else if (streamType === 'decklink') {
+    decklinkDevice(address);
+  }
+}
 
 const SourceInput = z.object({
   name: z.string().min(1),
   address: z.string(),
-  streamType: z.enum(['srt', 'efp', 'whip', 'html']),
+  streamType: z.enum(CREATABLE_STREAM_TYPES),
   status: z.enum(['active', 'inactive']).default('inactive'),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  mxlDomain: z.string().optional(),
+  mxlAudioFlowId: z.string().optional(),
+  mxlBackend: MxlBackend.optional(),
+  decklinkMode: z.string().optional(),
+  decklinkConnection: z.string().optional(),
+  decklinkVideoFormat: z.string().optional(),
 }).superRefine((data, ctx) => {
-  if (data.streamType === 'html') {
-    // html sources use a browser URL — validate for SSRF (file://, javascript:, private IPs, etc.)
-    try {
-      graphicUrl(data.address);
-    } catch (err) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid HTML source URL' });
+  try {
+    validateSourceAddress(data.streamType, data.address);
+  } catch (err) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid source address' });
+  }
+  if (data.streamType === 'mxl') {
+    if (data.mxlDomain) {
+      try { mxlDomain(data.mxlDomain); } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mxlDomain'], message: err instanceof Error ? err.message : 'Invalid MXL domain' });
+      }
     }
-  } else if (data.streamType === 'srt' || data.streamType === 'efp') {
-    // SRT/EFP sources: must be a valid srt:// URI pointing to a non-private host
-    try {
-      srtUrl(data.address);
-    } catch (err) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['address'], message: err instanceof Error ? err.message : 'Invalid SRT source address' });
+    if (data.mxlAudioFlowId) {
+      try { mxlFlowId(data.mxlAudioFlowId); } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mxlAudioFlowId'], message: err instanceof Error ? err.message : 'Invalid MXL audio flow ID' });
+      }
     }
   }
 });
@@ -34,10 +58,16 @@ const SourceInput = z.object({
 const SourcePatch = z.object({
   name: z.string().min(1).optional(),
   address: z.string().optional(),
-  streamType: z.enum(['srt', 'efp', 'whip', 'html']).optional(),
+  streamType: z.enum(CREATABLE_STREAM_TYPES).optional(),
   status: z.enum(['active', 'inactive']).optional(),
   liveCamera: z.boolean().optional(),
   latency: z.number().int().min(20).max(8000).optional(),
+  mxlDomain: z.string().optional(),
+  mxlAudioFlowId: z.string().optional(),
+  mxlBackend: MxlBackend.optional(),
+  decklinkMode: z.string().optional(),
+  decklinkConnection: z.string().optional(),
+  decklinkVideoFormat: z.string().optional(),
 });
 
 /** Masks passphrase values in SRT URIs so credentials are never returned to clients. */
@@ -77,6 +107,12 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       status: body.status,
       liveCamera: body.liveCamera,
       latency: body.latency,
+      mxlDomain: body.mxlDomain,
+      mxlAudioFlowId: body.mxlAudioFlowId,
+      mxlBackend: body.mxlBackend,
+      decklinkMode: body.decklinkMode,
+      decklinkConnection: body.decklinkConnection,
+      decklinkVideoFormat: body.decklinkVideoFormat,
       createdAt: now,
       updatedAt: now,
     };
@@ -104,13 +140,17 @@ const sourcesRoutes: FastifyPluginAsync = async (fastify) => {
       const effectiveAddress = body.address ?? doc.address;
       if (effectiveAddress) {
         try {
-          if (effectiveStreamType === 'html') {
-            graphicUrl(effectiveAddress);
-          } else if (effectiveStreamType === 'srt' || effectiveStreamType === 'efp') {
-            srtUrl(effectiveAddress);
-          }
+          validateSourceAddress(effectiveStreamType, effectiveAddress);
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid source address' });
+        }
+      }
+      if (effectiveStreamType === 'mxl') {
+        try {
+          if (body.mxlDomain) mxlDomain(body.mxlDomain);
+          if (body.mxlAudioFlowId) mxlFlowId(body.mxlAudioFlowId);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid MXL source field' });
         }
       }
       const updated: SourceDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };

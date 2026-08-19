@@ -5,6 +5,9 @@
  * - httpUrlOnly: allow only http/https schemes
  * - graphicUrl:  httpUrlOnly OR safe data: image URIs (no svg, no text/html)
  * - srtUrl:      srt:// scheme only
+ * - mxlFlowId:   UUID, optionally prefixed with mxl://
+ * - mxlDomain:   absolute filesystem path
+ * - decklinkDevice: non-negative integer device index
  */
 
 /**
@@ -60,5 +63,47 @@ export function srtUrl(url: string): void {
   }
   if (!SRT_URL_RE.test(url)) {
     throw new Error('SRT URL contains disallowed characters');
+  }
+}
+
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Accepts a bare UUID or `mxl://<uuid>` and returns the UUID string.
+ */
+export function parseMxlFlowId(value: string): string {
+  let id = value.trim();
+  if (/^mxl:\/\//i.test(id)) {
+    id = id.replace(/^mxl:\/\//i, '').replace(/\/+$/, '');
+  }
+  return id;
+}
+
+/**
+ * Throws if the value is not a UUID (optionally prefixed with mxl://).
+ */
+export function mxlFlowId(value: string): void {
+  const id = parseMxlFlowId(value);
+  if (!UUID_RE.test(id)) {
+    throw new Error('MXL flow ID must be a UUID (optionally prefixed with mxl://)');
+  }
+}
+
+/**
+ * Throws if the value is not an absolute filesystem path.
+ */
+export function mxlDomain(value: string): void {
+  const path = value.trim();
+  if (!path.startsWith('/') || path.includes('\0')) {
+    throw new Error('MXL domain must be an absolute filesystem path');
+  }
+}
+
+/**
+ * Throws if the value is not a non-negative integer (DeckLink device index).
+ */
+export function decklinkDevice(value: string): void {
+  if (!/^\d+$/.test(value.trim())) {
+    throw new Error('DeckLink device must be a non-negative integer');
   }
 }

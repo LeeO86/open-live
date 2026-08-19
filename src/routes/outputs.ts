@@ -4,14 +4,25 @@ import { z } from 'zod';
 import { getOutputsDb, getDb } from '../db/index.js';
 import type { OutputDoc, ProductionDoc } from '../db/types.js';
 import { updateProductionDoc } from './productions.js';
-import { srtUrl } from '../lib/url-validation.js';
+import { mxlDomain, mxlFlowId, srtUrl } from '../lib/url-validation.js';
 
 const SRT_OUTPUT_TYPES = new Set(['mpegtssrt', 'efpsrt']);
 
+const MxlTap = z.enum(['pgm', 'multiview']);
+const MxlBackend = z.enum(['auto', 'gpu', 'cpu']);
+const MxlAudioSource = z.enum(['main', 'monitor']);
+
 const OutputInput = z.object({
   name: z.string().min(1),
-  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep']),
+  outputType: z.enum(['mpegtssrt', 'efpsrt', 'whep', 'mxl']),
   url: z.string().optional(),
+  mxlTap: MxlTap.optional(),
+  mxlDomain: z.string().optional(),
+  mxlAudioFlowId: z.string().optional(),
+  mxlAudioSource: MxlAudioSource.optional(),
+  mxlBackend: MxlBackend.optional(),
+  mxlLabel: z.string().optional(),
+  mxlGroupHint: z.string().optional(),
 }).superRefine((data, ctx) => {
   if (SRT_OUTPUT_TYPES.has(data.outputType) && data.url) {
     try {
@@ -20,11 +31,35 @@ const OutputInput = z.object({
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: err instanceof Error ? err.message : 'Invalid SRT URL' });
     }
   }
+  if (data.outputType === 'mxl') {
+    if (data.url) {
+      try { mxlFlowId(data.url); } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['url'], message: err instanceof Error ? err.message : 'Invalid MXL flow ID' });
+      }
+    }
+    if (data.mxlDomain) {
+      try { mxlDomain(data.mxlDomain); } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mxlDomain'], message: err instanceof Error ? err.message : 'Invalid MXL domain' });
+      }
+    }
+    if (data.mxlAudioFlowId) {
+      try { mxlFlowId(data.mxlAudioFlowId); } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mxlAudioFlowId'], message: err instanceof Error ? err.message : 'Invalid MXL audio flow ID' });
+      }
+    }
+  }
 });
 
 const OutputPatch = z.object({
   name: z.string().min(1).optional(),
   url: z.string().optional(),
+  mxlTap: MxlTap.optional(),
+  mxlDomain: z.string().optional(),
+  mxlAudioFlowId: z.string().optional(),
+  mxlAudioSource: MxlAudioSource.optional(),
+  mxlBackend: MxlBackend.optional(),
+  mxlLabel: z.string().optional(),
+  mxlGroupHint: z.string().optional(),
 });
 
 function toApi(doc: OutputDoc) {
@@ -54,6 +89,13 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
       name: body.name,
       outputType: body.outputType,
       url: body.url,
+      mxlTap: body.mxlTap,
+      mxlDomain: body.mxlDomain,
+      mxlAudioFlowId: body.mxlAudioFlowId,
+      mxlAudioSource: body.mxlAudioSource,
+      mxlBackend: body.mxlBackend,
+      mxlLabel: body.mxlLabel,
+      mxlGroupHint: body.mxlGroupHint,
       createdAt: now,
       updatedAt: now,
     };
@@ -74,13 +116,21 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
     const body = OutputPatch.parse(req.body);
     try {
       const doc = await getOutputsDb().get(req.params.id);
-      // Validate the effective URL if output type is SRT-based
       const effectiveUrl = body.url ?? doc.url;
       if (SRT_OUTPUT_TYPES.has(doc.outputType) && effectiveUrl) {
         try {
           srtUrl(effectiveUrl);
         } catch (err) {
           return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid SRT URL' });
+        }
+      }
+      if (doc.outputType === 'mxl') {
+        try {
+          if (effectiveUrl) mxlFlowId(effectiveUrl);
+          if (body.mxlDomain) mxlDomain(body.mxlDomain);
+          if (body.mxlAudioFlowId) mxlFlowId(body.mxlAudioFlowId);
+        } catch (err) {
+          return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid MXL output field' });
         }
       }
       const updated: OutputDoc = { ...doc, ...body, updatedAt: new Date().toISOString() };

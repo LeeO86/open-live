@@ -22,7 +22,9 @@ export interface Macro {
 
 // --------------- Source types ---------------
 
-export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html';
+export type StreamType = 'srt' | 'efp' | 'whip' | 'test1' | 'test2' | 'html' | 'mxl' | 'decklink';
+
+export type MxlBackend = 'auto' | 'gpu' | 'cpu';
 
 export type SourceStatus = 'active' | 'inactive';
 
@@ -37,8 +39,24 @@ export interface SourceDoc {
   liveCamera?: boolean;
   /** SRT receiver buffer latency in ms. Only applies to srt/efp stream types. Default 125. */
   latency?: number;
+  /** MXL domain path. Default `/dev/shm/mxl`. */
+  mxlDomain?: string;
+  /** Optional MXL audio flow UUID. If omitted, the source is video-only. */
+  mxlAudioFlowId?: string;
+  mxlBackend?: MxlBackend;
+  /** DeckLink video mode (e.g. `auto`, `1080p50`). */
+  decklinkMode?: string;
+  decklinkConnection?: string;
+  decklinkVideoFormat?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** True when this source contributes an audio pad to the mixer. */
+export function sourceExposesAudio(src: { streamType: string; mxlAudioFlowId?: string }): boolean {
+  if (src.streamType === 'test1' || src.streamType === 'test2') return false;
+  if (src.streamType === 'mxl') return Boolean(src.mxlAudioFlowId?.trim());
+  return true;
 }
 
 // --------------- Graphic types ---------------
@@ -55,7 +73,10 @@ export interface GraphicDoc {
 
 // --------------- Output types ---------------
 
-export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep';
+export type OutputType = 'mpegtssrt' | 'efpsrt' | 'whep' | 'mxl';
+
+export type MxlTap = 'pgm' | 'multiview';
+export type MxlAudioSource = 'main' | 'monitor';
 
 export interface OutputDoc {
   _id: string;           // "output-{uuid}"
@@ -63,7 +84,14 @@ export interface OutputDoc {
   type: 'output';
   name: string;
   outputType: OutputType;
-  url?: string;          // SRT URI for mpegtssrt/efpsrt; undefined for whep
+  url?: string;          // SRT URI for mpegtssrt/efpsrt; MXL video flow UUID for mxl; undefined for whep
+  mxlTap?: MxlTap;
+  mxlDomain?: string;
+  mxlAudioFlowId?: string;
+  mxlAudioSource?: MxlAudioSource;
+  mxlBackend?: MxlBackend;
+  mxlLabel?: string;
+  mxlGroupHint?: string;
   createdAt: string;
   updatedAt: string;
 }
